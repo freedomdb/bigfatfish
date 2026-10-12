@@ -85,84 +85,6 @@ def save_config(cfg):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-# 创业板热门股票代码（深交所创业板 300xxx）
-CYB_STOCKS = [
-    'sz300750', 'sz300059', 'sz300124', 'sz300142', 'sz300274',
-    'sz300760', 'sz300015', 'sz300033', 'sz300122', 'sz300347',
-    'sz300498', 'sz300601', 'sz300628', 'sz300676', 'sz300769',
-    'sz300782', 'sz300896', 'sz300919', 'sz300979', 'sz300122',
-]
-
-def get_stock_data(codes):
-    """新浪实时行情，返回 {代码: {name, open, pre_close, price, high, low, change_pct}}"""
-    import urllib.parse
-    try:
-        q = ','.join(codes)
-        url = f'http://hq.sinajs.cn/list={q}'
-        req = urllib.request.Request(url, headers={'Referer': 'https://finance.sina.com.cn'})
-        resp = urllib.request.urlopen(req, timeout=10)
-        text = resp.read().decode('gbk', errors='ignore')
-        result = {}
-        for line in text.strip().split('\n'):
-            if 'hq_str_' not in line:
-                continue
-            code = line.split('hq_str_')[1].split('=')[0]
-            data = line.split('"')[1].split(',')
-            if len(data) < 32 or not data[3]:
-                continue
-            try:
-                pre_close = float(data[2])
-                price = float(data[3])
-                change_pct = (price - pre_close) / pre_close * 100 if pre_close else 0
-                result[code] = {
-                    'name': data[0], 'open': data[1], 'pre_close': data[2],
-                    'price': price, 'high': data[4], 'low': data[5],
-                    'change_pct': round(change_pct, 2), 'time': data[30] + ' ' + data[31],
-                }
-            except: pass
-        return result
-    except:
-        return {}
-
-def get_cyb_top10():
-    """创业板涨幅前十"""
-    data = get_stock_data(CYB_STOCKS)
-    ranked = sorted(data.items(), key=lambda x: x[1]['change_pct'], reverse=True)[:10]
-    return ranked
-
-def web_search(query, max_results=5):
-    """Bing 联网搜索，返回 [(标题, 摘要, 链接)]"""
-    import urllib.parse
-    import re
-    try:
-        q = urllib.parse.quote(query)
-        url = f'https://www.bing.com/search?q={q}&mkt=zh-CN'
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
-        })
-        resp = urllib.request.urlopen(req, timeout=15)
-        html = resp.read().decode('utf-8', errors='ignore')
-        results = []
-        # Bing 结果在 li.b_algo 里
-        for m in re.finditer(r'<li class="b_algo"[^>]*>(.*?)</li>', html, re.S):
-            block = m.group(1)
-            # 标题和链接
-            tm = re.search(r'<h2>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
-            # 摘要
-            sm = re.search(r'<div class="b_caption"[^>]*>.*?<p[^>]*>(.*?)</p>', block, re.S)
-            if tm:
-                link = tm.group(1)
-                title = re.sub(r'<[^>]+>', '', tm.group(2)).strip()
-                snippet = re.sub(r'<[^>]+>', '', sm.group(1)).strip() if sm else ''
-                # 过滤 bing 内部链接
-                if link.startswith('http') and 'bing.com' not in link and title:
-                    results.append((title, snippet, link))
-                    if len(results) >= max_results:
-                        break
-        return results
-    except Exception as e:
-        return []
-
 def make_hover(btn, normal_bg, hover_bg):
     """按钮悬停效果"""
     btn.bind('<Enter>', lambda e: btn.config(bg=hover_bg))
@@ -415,6 +337,12 @@ class BigFatFishApp:
         self.chat_text.tag_config('attach', foreground=ACCENT, font=('Microsoft YaHei', 10))
         self.chat_text.tag_config('welcome', foreground=MUTED, font=('Microsoft YaHei', 12),
                                    justify='center', spacing1=20)
+        # Markdown 样式
+        self.chat_text.tag_config('md_bold', font=('Microsoft YaHei', 11, 'bold'))
+        self.chat_text.tag_config('md_code', font=('Consolas', 10), background='#f6f8fa',
+                                   foreground='#24292f')
+        self.chat_text.tag_config('md_h', font=('Microsoft YaHei', 13, 'bold'),
+                                   foreground='#1f2328', spacing1=6)
 
     def upload_file(self):
         """选择文件上传"""
@@ -538,9 +466,12 @@ class BigFatFishApp:
         tag = 'user' if role == 'user' else 'ai'
         prefix = '👤 你\n' if role == 'user' else '🐋 AI\n'
         self.chat_text.insert('end', prefix, 'meta')
-        # 插入内容并处理链接
+        # 插入内容（带 Markdown 解析）
         start_idx = self.chat_text.index('end-1c')
-        self.chat_text.insert('end', content + '\n', tag)
+        if role == 'assistant':
+            self._insert_markdown(content + '\n', tag)
+        else:
+            self.chat_text.insert('end', content + '\n', tag)
         # 查找 URL 并设为可点击
         url_pattern = r'https?://[^\s\)\]]+'
         text_start = start_idx
@@ -559,6 +490,40 @@ class BigFatFishApp:
         self.chat_text.insert('end', '\n')
         self.chat_text.config(state='disabled')
         self.chat_text.see('end')
+
+    def _insert_markdown(self, text, base_tag):
+        """简单 Markdown 渲染：加粗、行内代码、标题、链接"""
+        import re
+        import webbrowser
+        # 按行处理标题
+        for line in text.split('\n'):
+            # 标题行
+            hm = re.match(r'^(#{1,3})\s+(.*)', line)
+            if hm:
+                self.chat_text.insert('end', hm.group(2) + '\n', (base_tag, 'md_h'))
+                continue
+            # 行内：加粗、代码、链接
+            pos = 0
+            for m in re.finditer(r'(\*\*(.+?)\*\*)|(`(.+?)`)|(\[([^\]]+)\]\((https?://[^\)]+)\))', line):
+                # 普通文本
+                if m.start() > pos:
+                    self.chat_text.insert('end', line[pos:m.start()], base_tag)
+                if m.group(2):  # 加粗
+                    self.chat_text.insert('end', m.group(2), (base_tag, 'md_bold'))
+                elif m.group(4):  # 代码
+                    self.chat_text.insert('end', m.group(4), (base_tag, 'md_code'))
+                elif m.group(6):  # Markdown 链接 [文字](url)
+                    link_text, url = m.group(6), m.group(7)
+                    link_tag = f'mdlink_{hash(url) % 100000}'
+                    self.chat_text.tag_config(link_tag, foreground='#0969da', underline=True)
+                    self.chat_text.insert('end', link_text, (base_tag, link_tag))
+                    self.chat_text.tag_bind(link_tag, '<Button-1>', lambda ev, u=url: webbrowser.open(u))
+                    self.chat_text.tag_bind(link_tag, '<Enter>', lambda ev: self.chat_text.config(cursor='hand2'))
+                    self.chat_text.tag_bind(link_tag, '<Leave>', lambda ev: self.chat_text.config(cursor='arrow'))
+                pos = m.end()
+            if pos < len(line):
+                self.chat_text.insert('end', line[pos:], base_tag)
+            self.chat_text.insert('end', '\n', base_tag)
 
     def render_all(self):
         self.chat_text.config(state='normal')
@@ -713,6 +678,8 @@ class BigFatFishApp:
     def delete_history(self):
         sel = self.history_box.curselection()
         if not sel: return
+        if not messagebox.askyesno('确认', '确定删除这条历史记录吗？'):
+            return
         fid = self.history_ids[sel[0]]
         fp = os.path.join(HISTORY_DIR, fid + '.json')
         if os.path.exists(fp): os.remove(fp)
@@ -742,7 +709,7 @@ class BigFatFishApp:
     def open_settings(self):
         win = tk.Toplevel(self.root)
         win.title('设置')
-        win.geometry('450x420')
+        win.geometry('450x520')
         win.configure(bg=BG2)
         win.transient(self.root)
         win.grab_set()
